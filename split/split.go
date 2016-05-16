@@ -206,8 +206,9 @@ func (f *fileAsDir) Attr(ctx context.Context, attr *fuse.Attr) error {
 }
 
 const minFormatZeroes = 8
+const chunkFileExtension = ".splitfs.chunk"
 
-var fileAsDirFormatString = fmt.Sprintf("%%x_%%0%dd_of_%%0%dd", minFormatZeroes, minFormatZeroes)
+var fileAsDirFormatString = fmt.Sprintf("%%x_%%0%dd_of_%%0%dd%s", minFormatZeroes, minFormatZeroes, chunkFileExtension)
 
 // ceilAndRemainder returns (ceil(x / y), x mod y).
 // It panics if y == 0.
@@ -236,19 +237,21 @@ func (f *fileAsDir) ReadDirAll(context.Context) ([]fuse.Dirent, error) {
 		return nil, osToFuseErr(err)
 	}
 	entries := make([]fuse.Dirent, numChunks)
-	lastChunkNumber := numChunks - 1
 	for i := int64(0); i < numChunks; i++ {
 		entries[i] = fuse.Dirent{
-			Inode: f.hash + uint64(i),
+			Inode: f.hash + uint64(i+1),
 			Type:  fuse.DT_File,
-			Name:  fmt.Sprintf(fileAsDirFormatString, f.hash, i, lastChunkNumber),
+			Name:  fmt.Sprintf(fileAsDirFormatString, f.hash, i+1, numChunks),
 		}
 	}
 	return entries, nil
 }
 
 func (f *fileAsDir) Lookup(_ context.Context, name string) (fs.Node, error) {
-	parts := strings.Split(name, "_")
+	if !strings.HasSuffix(name, chunkFileExtension) {
+		return nil, fuse.ENOENT
+	}
+	parts := strings.Split(strings.TrimSuffix(name, chunkFileExtension), "_")
 	if len(parts) != 4 {
 		return nil, fuse.ENOENT
 	}
@@ -264,7 +267,8 @@ func (f *fileAsDir) Lookup(_ context.Context, name string) (fs.Node, error) {
 	if err != nil || chunk < 0 {
 		return nil, fuse.ENOENT
 	}
-	lastChunk, err := strconv.ParseInt(totalChunksPart, 10, 64)
+	chunk-- // Filenames are 1-indexed, so convert back down to 0.
+	numChunksFromFilename, err := strconv.ParseInt(totalChunksPart, 10, 64)
 	if err != nil {
 		return nil, fuse.ENOENT
 	}
@@ -272,15 +276,16 @@ func (f *fileAsDir) Lookup(_ context.Context, name string) (fs.Node, error) {
 	if err != nil {
 		return nil, osToFuseErr(err)
 	}
-	if lastChunk+1 != numChunks || chunk >= numChunks {
+	if numChunksFromFilename != numChunks || chunk >= numChunks {
 		return nil, fuse.ENOENT
 	}
 	size := f.splitFS.chunkSize
-	if chunk == lastChunk {
+	if chunk == numChunks-1 {
 		size = lastChunkSize
 	}
 	return &fileChunk{
 		node:   f.node,
+		chunk:  chunk,
 		offset: chunk * f.splitFS.chunkSize,
 		size:   size,
 	}, nil
@@ -300,6 +305,7 @@ func init() {
 
 type fileChunk struct {
 	*node
+	chunk  int64
 	offset int64
 	size   int64
 }
@@ -311,6 +317,7 @@ func (f *fileChunk) Attr(ctx context.Context, attr *fuse.Attr) error {
 	if err := f.node.Attr(ctx, attr); err != nil {
 		return err
 	}
+	attr.Inode += uint64(f.chunk + 1)
 	attr.Size = uint64(f.size)
 	numBlocks, _ := ceilAndRemainder(f.size, 512)
 	attr.Blocks = uint64(numBlocks)
@@ -325,8 +332,10 @@ func (f *fileChunk) Open(_ context.Context, req *fuse.OpenRequest, resp *fuse.Op
 	if err != nil {
 		return nil, osToFuseErr(err)
 	}
-	if _, err := file.Seek(f.offset, 0); err != nil {
-		return nil, osToFuseErr(err)
+	if f.offset != 0 {
+		if _, err := file.Seek(f.offset, 0); err != nil {
+			return nil, osToFuseErr(err)
+		}
 	}
 	resp.Handle = <-handleIDProvider
 	return &fileChunkHandle{f, file}, nil
@@ -344,8 +353,11 @@ var _ fs.HandleReleaser = (*fileChunkHandle)(nil)
 func (f *fileChunkHandle) Read(_ context.Context, req *fuse.ReadRequest, resp *fuse.ReadResponse) error {
 	trueOffset := req.Offset + f.offset
 	trueSize := int64(req.Size)
-	if trueSize < f.size-f.offset {
-		trueSize = f.size - f.offset
+	if trueSize > f.size-req.Offset {
+		trueSize = f.size - req.Offset
+	}
+	if trueSize < 0 {
+		trueSize = 0
 	}
 	bytes := make([]byte, trueSize)
 	read, err := f.file.ReadAt(bytes, trueOffset)
