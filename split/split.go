@@ -10,6 +10,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"syscall"
@@ -23,15 +24,36 @@ import (
 type splitFS struct {
 	sourceDirectory string
 	chunkSize       int64
+	excludeRegexp   *regexp.Regexp
 }
 
 var _ fs.FS = (*splitFS)(nil)
+
+type Option func(*splitFS) error
+
+func ExcludeRegexp(exclude string) Option {
+	return func(f *splitFS) error {
+		excludeRegexp, err := regexp.Compile(exclude)
+		if err != nil {
+			return fmt.Errorf("invalid regexp %q: %v", exclude, err)
+		}
+		f.excludeRegexp = excludeRegexp
+		return nil
+	}
+}
 
 func (f *splitFS) Root() (fs.Node, error) {
 	return &directory{&node{f, ""}}, nil
 }
 
-func NewFS(sourceDirectory string, chunkSize int64) (fs.FS, error) {
+func (f *splitFS) IsExcluded(path string) bool {
+	if f.excludeRegexp == nil {
+		return false
+	}
+	return f.excludeRegexp.MatchString(path)
+}
+
+func NewFS(sourceDirectory string, chunkSize int64, options ...Option) (fs.FS, error) {
 	if chunkSize <= 0 {
 		return nil, fmt.Errorf("chunksize (%d bytes) must be larger than 0", chunkSize)
 	}
@@ -46,10 +68,16 @@ func NewFS(sourceDirectory string, chunkSize int64) (fs.FS, error) {
 	if err != nil {
 		return nil, fmt.Errorf("cannot convert %q to absolute directory: %v", sourceDirectory, err)
 	}
-	return &splitFS{
+	f := &splitFS{
 		sourceDirectory: absoluteSource,
 		chunkSize:       chunkSize,
-	}, nil
+	}
+	for _, option := range options {
+		if err := option(f); err != nil {
+			return nil, fmt.Errorf("canot apply options: %v", err)
+		}
+	}
+	return f, nil
 }
 
 type node struct {
@@ -132,12 +160,15 @@ var _ fs.Node = (*directory)(nil)
 var _ fs.HandleReadDirAller = (*directory)(nil)
 
 func (d *directory) ReadDirAll(context.Context) ([]fuse.Dirent, error) {
-	files, err := ioutil.ReadDir(d.FullPath())
+	fullPath := d.FullPath()
+	files, err := ioutil.ReadDir(fullPath)
 	if err != nil {
 		return nil, osToFuseErr(err)
 	}
 	entries := make([]fuse.Dirent, len(files))
 	for i, f := range files {
+		name := f.Name()
+		isExcluded := d.splitFS.IsExcluded(path.Join(fullPath, name))
 		var inode uint64
 		if sys := f.Sys(); sys != nil {
 			inode = sys.(*syscall.Stat_t).Ino
@@ -145,7 +176,11 @@ func (d *directory) ReadDirAll(context.Context) ([]fuse.Dirent, error) {
 		direntType := fuse.DT_Unknown
 		mode := f.Mode()
 		if mode.IsRegular() {
-			direntType = fuse.DT_File
+			if isExcluded {
+				direntType = fuse.DT_File
+			} else {
+				direntType = fuse.DT_Dir
+			}
 		} else if mode.IsDir() {
 			direntType = fuse.DT_Dir
 		} else if mode&os.ModeSymlink != 0 {
@@ -162,7 +197,7 @@ func (d *directory) ReadDirAll(context.Context) ([]fuse.Dirent, error) {
 		entries[i] = fuse.Dirent{
 			Inode: inode,
 			Type:  direntType,
-			Name:  f.Name(),
+			Name:  name,
 		}
 	}
 	return entries, nil
@@ -181,12 +216,72 @@ func (d *directory) Lookup(_ context.Context, name string) (fs.Node, error) {
 		return &directory{newNode}, nil
 	}
 	if mode.IsRegular() {
+		if d.splitFS.IsExcluded(fullPath) {
+			return &directFile{newNode}, nil
+		}
 		fileHash := fnv.New64()
 		fileHash.Sum([]byte(rootRelativePath))
 		return &fileAsDir{newNode, fileHash.Sum64()}, nil
 	}
 	// TODO: Implement other types.
 	return nil, errors.New("unimplemented")
+}
+
+type directFile struct {
+	*node
+}
+
+var _ fs.Node = (*directFile)(nil)
+var _ fs.NodeOpener = (*directFile)(nil)
+
+var handleIDProvider <-chan fuse.HandleID
+
+func init() {
+	idProvider := make(chan fuse.HandleID)
+	handleIDProvider = idProvider
+	go func() {
+		for id := fuse.HandleID(2); ; id++ {
+			idProvider <- id
+		}
+	}()
+}
+
+func (f *directFile) Open(_ context.Context, req *fuse.OpenRequest, resp *fuse.OpenResponse) (fs.Handle, error) {
+	if !req.Flags.IsReadOnly() {
+		return nil, fuse.Errno(syscall.EROFS)
+	}
+	file, err := os.Open(f.FullPath())
+	if err != nil {
+		return nil, osToFuseErr(err)
+	}
+	resp.Handle = <-handleIDProvider
+	return &directFileHandle{f, file}, nil
+}
+
+type directFileHandle struct {
+	*directFile
+	file *os.File
+}
+
+var _ fs.Handle = (*directFileHandle)(nil)
+var _ fs.HandleReader = (*directFileHandle)(nil)
+var _ fs.HandleReleaser = (*directFileHandle)(nil)
+
+func (f *directFileHandle) Read(_ context.Context, req *fuse.ReadRequest, resp *fuse.ReadResponse) error {
+	bytes := make([]byte, req.Size)
+	read, err := f.file.ReadAt(bytes, req.Offset)
+	if err != nil && err != io.EOF {
+		return osToFuseErr(err)
+	}
+	resp.Data = bytes[:read]
+	return nil
+}
+
+func (f *directFileHandle) Release(_ context.Context, req *fuse.ReleaseRequest) error {
+	if err := f.file.Close(); err != nil {
+		return osToFuseErr(err)
+	}
+	return nil
 }
 
 type fileAsDir struct {
@@ -289,18 +384,6 @@ func (f *fileAsDir) Lookup(_ context.Context, name string) (fs.Node, error) {
 		offset: chunk * f.splitFS.chunkSize,
 		size:   size,
 	}, nil
-}
-
-var handleIDProvider <-chan fuse.HandleID
-
-func init() {
-	idProvider := make(chan fuse.HandleID)
-	handleIDProvider = idProvider
-	go func() {
-		for id := fuse.HandleID(2); ; id++ {
-			idProvider <- id
-		}
-	}()
 }
 
 type fileChunk struct {
