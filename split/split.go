@@ -219,8 +219,15 @@ func (d *directory) Lookup(_ context.Context, name string) (fs.Node, error) {
 		if d.splitFS.IsExcluded(fullPath) {
 			return &directFile{newNode}, nil
 		}
-		fileHash := fnv.New64()
-		fileHash.Sum([]byte(rootRelativePath))
+		fileHash := fnv.New64a()
+		rootRelativePathBytes := []byte(rootRelativePath)
+		written, err := fileHash.Write(rootRelativePathBytes)
+		if err != nil {
+			return nil, fmt.Errorf("cannot compute hash: %v", err)
+		}
+		if written != len(rootRelativePathBytes) {
+			return nil, fmt.Errorf("could not write all bytes to file hash: %d bytes written, but expected %d bytes", written, len(rootRelativePathBytes))
+		}
 		return &fileAsDir{newNode, fileHash.Sum64()}, nil
 	}
 	// TODO: Implement other types.
