@@ -145,7 +145,7 @@ func copyStatToAttr(stat *syscall.Stat_t, attr *fuse.Attr) {
 
 func (n *node) Attr(_ context.Context, attr *fuse.Attr) error {
 	stat := &syscall.Stat_t{}
-	if err := syscall.Stat(n.FullPath(), stat); err != nil {
+	if err := syscall.Lstat(n.FullPath(), stat); err != nil {
 		return osToFuseErr(err)
 	}
 	copyStatToAttr(stat, attr)
@@ -206,7 +206,7 @@ func (d *directory) ReadDirAll(context.Context) ([]fuse.Dirent, error) {
 func (d *directory) Lookup(_ context.Context, name string) (fs.Node, error) {
 	rootRelativePath := path.Join(d.rootRelativePath, name)
 	fullPath := path.Join(d.FullPath(), name)
-	stat, err := os.Stat(fullPath)
+	stat, err := os.Lstat(fullPath)
 	if err != nil {
 		return nil, osToFuseErr(err)
 	}
@@ -229,6 +229,9 @@ func (d *directory) Lookup(_ context.Context, name string) (fs.Node, error) {
 			return nil, fmt.Errorf("could not write all bytes to file hash: %d bytes written, but expected %d bytes", written, len(rootRelativePathBytes))
 		}
 		return &fileAsDir{newNode, fileHash.Sum64()}, nil
+	}
+	if mode&os.ModeSymlink != 0 {
+		return &symlink{newNode}, nil
 	}
 	// TODO: Implement other types.
 	return nil, errors.New("unimplemented")
@@ -289,6 +292,21 @@ func (f *directFileHandle) Release(_ context.Context, req *fuse.ReleaseRequest) 
 		return osToFuseErr(err)
 	}
 	return nil
+}
+
+type symlink struct {
+	*node
+}
+
+var _ fs.Node = (*symlink)(nil)
+var _ fs.NodeReadlinker = (*symlink)(nil)
+
+func (s *symlink) Readlink(context.Context, *fuse.ReadlinkRequest) (string, error) {
+	link, err := os.Readlink(s.FullPath())
+	if err != nil {
+		return "", osToFuseErr(err)
+	}
+	return link, nil
 }
 
 type fileAsDir struct {
