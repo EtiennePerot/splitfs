@@ -5,6 +5,8 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"net/http"
+	_ "net/http/pprof"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -19,7 +21,7 @@ var progName = filepath.Base(os.Args[0])
 
 func usage() {
 	fmt.Fprintf(os.Stderr, "Usage of %s:\n", progName)
-	fmt.Fprintf(os.Stderr, "  %s <chunk size in bytes> <source directory> <target mountpoint>\n", progName)
+	fmt.Fprintf(os.Stderr, "  %s [options] <source directory> <target mountpoint>\n", progName)
 	flag.PrintDefaults()
 }
 
@@ -55,6 +57,7 @@ func main() {
 	excludeRegexpFlag := flag.String("exclude_regexp", "", "If specified, files with paths matching this regex (rooted at the source directory) will be reflected as plain, non-split files in the mountpoint. The regex is not full-match; use ^ and $ to make it so.")
 	filenameIncludesTotalChunksFlag := flag.Bool("filename_includes_total_chunks", true, "Whether or not the filenames will also contain the total number of chunks of the overall file.")
 	filenameIncludesMtimeFlag := flag.Bool("filename_includes_mtime", false, "Whether or not the filenames will also contain the mtime the overall file.")
+	pprofHostPortFlag := flag.String("pprof_host_port", "", "If specified, bind to this 'host:port'-formatted string and export pprof HTTP handlers on it. Useful for debugging.")
 	flag.Parse()
 	if flag.NArg() != 2 {
 		usage()
@@ -62,6 +65,9 @@ func main() {
 	}
 	sourceDirectory := flag.Arg(0)
 	targetMountpoint := flag.Arg(1)
+	if *pprofHostPortFlag != "" {
+		go http.ListenAndServe(*pprofHostPortFlag, http.DefaultServeMux)
+	}
 	chunkSize, err := parseChunkSize(*chunkSizeFlag)
 	if err != nil {
 		log.Fatalf("Invalid chunk size %q: %v", *chunkSizeFlag, err)
