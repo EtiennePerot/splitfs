@@ -53,6 +53,8 @@ func main() {
 	flag.Usage = usage
 	chunkSizeFlag := flag.String("chunk_size", "32MiB", "Chunk size. Available units: B, KiB, MiB, GiB, TiB.")
 	excludeRegexpFlag := flag.String("exclude_regexp", "", "If specified, files with paths matching this regex (rooted at the source directory) will be reflected as plain, non-split files in the mountpoint. The regex is not full-match; use ^ and $ to make it so.")
+	filenameIncludesTotalChunksFlag := flag.Bool("filename_includes_total_chunks", true, "Whether or not the filenames will also contain the total number of chunks of the overall file.")
+	filenameIncludesMtimeFlag := flag.Bool("filename_includes_mtime", false, "Whether or not the filenames will also contain the mtime the overall file.")
 	flag.Parse()
 	if flag.NArg() != 2 {
 		usage()
@@ -68,6 +70,8 @@ func main() {
 	if *excludeRegexpFlag != "" {
 		options = append(options, split.ExcludeRegexp(*excludeRegexpFlag))
 	}
+	options = append(options, split.FilenameIncludesTotalChunks(*filenameIncludesTotalChunksFlag))
+	options = append(options, split.FilenameIncludesMtime(*filenameIncludesMtimeFlag))
 	splitFS, err := split.NewFS(sourceDirectory, int64(chunkSize), options...)
 	if err != nil {
 		log.Fatalf("Cannot initialize filesystem: %v", err)

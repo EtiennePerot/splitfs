@@ -22,9 +22,11 @@ import (
 )
 
 type splitFS struct {
-	sourceDirectory string
-	chunkSize       int64
-	excludeRegexp   *regexp.Regexp
+	sourceDirectory             string
+	chunkSize                   int64
+	excludeRegexp               *regexp.Regexp
+	filenameIncludesTotalChunks bool
+	filenameIncludesMtime       bool
 }
 
 var _ fs.FS = (*splitFS)(nil)
@@ -38,6 +40,20 @@ func ExcludeRegexp(exclude string) Option {
 			return fmt.Errorf("invalid regexp %q: %v", exclude, err)
 		}
 		f.excludeRegexp = excludeRegexp
+		return nil
+	}
+}
+
+func FilenameIncludesTotalChunks(filenameIncludesTotalChunks bool) Option {
+	return func(f *splitFS) error {
+		f.filenameIncludesTotalChunks = filenameIncludesTotalChunks
+		return nil
+	}
+}
+
+func FilenameIncludesMtime(filenameIncludesMtime bool) Option {
+	return func(f *splitFS) error {
+		f.filenameIncludesMtime = filenameIncludesMtime
 		return nil
 	}
 }
@@ -69,8 +85,9 @@ func NewFS(sourceDirectory string, chunkSize int64, options ...Option) (fs.FS, e
 		return nil, fmt.Errorf("cannot convert %q to absolute directory: %v", sourceDirectory, err)
 	}
 	f := &splitFS{
-		sourceDirectory: absoluteSource,
-		chunkSize:       chunkSize,
+		sourceDirectory:             absoluteSource,
+		chunkSize:                   chunkSize,
+		filenameIncludesTotalChunks: true,
 	}
 	for _, option := range options {
 		if err := option(f); err != nil {
@@ -328,7 +345,8 @@ func (f *fileAsDir) Attr(ctx context.Context, attr *fuse.Attr) error {
 const minFormatZeroes = 8
 const chunkFileExtension = ".splitfs.chunk"
 
-var fileAsDirFormatString = fmt.Sprintf("%%x_%%0%dd_of_%%0%dd%s", minFormatZeroes, minFormatZeroes, chunkFileExtension)
+var fileAsDirWithTotalChunksFormatString = fmt.Sprintf("%%016x_%%0%dd_of_%%0%dd%%s%s", minFormatZeroes, minFormatZeroes, chunkFileExtension)
+var fileAsDirWithoutTotalChunksFormatString = fmt.Sprintf("%%016x_%%0%dd%%s%s", minFormatZeroes, chunkFileExtension)
 
 // ceilAndRemainder returns (ceil(x / y), x mod y).
 // It panics if y == 0.
@@ -341,27 +359,42 @@ func ceilAndRemainder(x, y int64) (int64, int64) {
 	return q, r
 }
 
-// getChunks returns (number of chunks, size of last chunk in bytes, error)
-func (f *fileAsDir) getChunks() (int64, int64, error) {
+type fileAsDirData struct {
+	numberOfChunks int64
+	lastChunkSize  int64
+	mtime          time.Time
+}
+
+func (f *fileAsDir) getData() (fileAsDirData, error) {
 	stat, err := os.Stat(f.FullPath())
 	if err != nil {
-		return 0, 0, err
+		return fileAsDirData{}, err
 	}
 	numChunks, lastChunkSize := ceilAndRemainder(stat.Size(), f.splitFS.chunkSize)
-	return numChunks, lastChunkSize, nil
+	return fileAsDirData{numChunks, lastChunkSize, stat.ModTime().Truncate(time.Second)}, nil
 }
 
 func (f *fileAsDir) ReadDirAll(context.Context) ([]fuse.Dirent, error) {
-	numChunks, _, err := f.getChunks()
+	data, err := f.getData()
 	if err != nil {
 		return nil, osToFuseErr(err)
 	}
-	entries := make([]fuse.Dirent, numChunks)
-	for i := int64(0); i < numChunks; i++ {
+	mtime := ""
+	if f.splitFS.filenameIncludesMtime {
+		mtime = fmt.Sprintf(".mtime=%d", data.mtime.Unix())
+	}
+	entries := make([]fuse.Dirent, data.numberOfChunks)
+	for i := int64(0); i < data.numberOfChunks; i++ {
+		var name string
+		if f.splitFS.filenameIncludesTotalChunks {
+			name = fmt.Sprintf(fileAsDirWithTotalChunksFormatString, f.hash, i+1, data.numberOfChunks, mtime)
+		} else {
+			name = fmt.Sprintf(fileAsDirWithoutTotalChunksFormatString, f.hash, i+1, mtime)
+		}
 		entries[i] = fuse.Dirent{
 			Inode: f.hash + uint64(i+1),
 			Type:  fuse.DT_File,
-			Name:  fmt.Sprintf(fileAsDirFormatString, f.hash, i+1, numChunks),
+			Name:  name,
 		}
 	}
 	return entries, nil
@@ -371,13 +404,41 @@ func (f *fileAsDir) Lookup(_ context.Context, name string) (fs.Node, error) {
 	if !strings.HasSuffix(name, chunkFileExtension) {
 		return nil, fuse.ENOENT
 	}
-	parts := strings.Split(strings.TrimSuffix(name, chunkFileExtension), "_")
-	if len(parts) != 4 {
-		return nil, fuse.ENOENT
+	name = strings.TrimSuffix(name, chunkFileExtension)
+	var mtime time.Time
+	if f.splitFS.filenameIncludesMtime {
+		dotIndex := strings.LastIndex(name, ".")
+		if dotIndex == -1 {
+			return nil, fuse.ENOENT
+		}
+		mtimeSplit := strings.Split(name[dotIndex+1:], "=")
+		if len(mtimeSplit) != 2 || mtimeSplit[0] != "mtime" {
+			return nil, fuse.ENOENT
+		}
+		mtimeUnix, err := strconv.ParseInt(mtimeSplit[1], 10, 64)
+		if err != nil {
+			return nil, fuse.ENOENT
+		}
+		mtime = time.Unix(mtimeUnix, 0)
+		name = name[:dotIndex]
 	}
-	hashPart, chunkPart, ofPart, totalChunksPart := parts[0], parts[1], parts[2], parts[3]
-	if ofPart != "of" {
-		return nil, fuse.ENOENT
+	parts := strings.Split(name, "_")
+	var hashPart, chunkPart, totalChunksPart string
+	if f.splitFS.filenameIncludesTotalChunks {
+		if len(parts) != 4 {
+			return nil, fuse.ENOENT
+		}
+		hashPart, chunkPart, totalChunksPart = parts[0], parts[1], parts[3]
+
+		if parts[2] != "of" {
+			return nil, fuse.ENOENT
+		}
+	}
+	if !f.splitFS.filenameIncludesTotalChunks {
+		if len(parts) != 2 {
+			return nil, fuse.ENOENT
+		}
+		hashPart, chunkPart = parts[0], parts[1]
 	}
 	hash, err := strconv.ParseUint(hashPart, 16, 64)
 	if err != nil || hash != f.hash {
@@ -388,20 +449,30 @@ func (f *fileAsDir) Lookup(_ context.Context, name string) (fs.Node, error) {
 		return nil, fuse.ENOENT
 	}
 	chunk-- // Filenames are 1-indexed, so convert back down to 0.
-	numChunksFromFilename, err := strconv.ParseInt(totalChunksPart, 10, 64)
-	if err != nil {
-		return nil, fuse.ENOENT
-	}
-	numChunks, lastChunkSize, err := f.getChunks()
+	data, err := f.getData()
 	if err != nil {
 		return nil, osToFuseErr(err)
 	}
-	if numChunksFromFilename != numChunks || chunk >= numChunks {
+	if f.splitFS.filenameIncludesTotalChunks {
+		numChunksFromFilename, err := strconv.ParseInt(totalChunksPart, 10, 64)
+		if err != nil {
+			return nil, fuse.ENOENT
+		}
+		if numChunksFromFilename != data.numberOfChunks {
+			return nil, fuse.ENOENT
+		}
+	}
+	if f.splitFS.filenameIncludesMtime {
+		if mtime != data.mtime {
+			return nil, fuse.ENOENT
+		}
+	}
+	if chunk >= data.numberOfChunks {
 		return nil, fuse.ENOENT
 	}
 	size := f.splitFS.chunkSize
-	if chunk == numChunks-1 {
-		size = lastChunkSize
+	if chunk == data.numberOfChunks-1 {
+		size = data.lastChunkSize
 	}
 	return &fileChunk{
 		node:   f.node,
