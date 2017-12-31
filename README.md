@@ -22,7 +22,7 @@ $ tree /testdata
 
 1 directory, 7 files
 
-$ splitfs --chunk_size=10KiB /testdata /mnt
+$ splitfs --chunk_size=10KiB ./testdata /mnt
 
 $ tree /mnt
 /mnt
@@ -77,6 +77,9 @@ splitfs [flags] <source_directory> <mountpoint>
 
 * `chunk_size`: The size of each chunk. Must be suffixed by a unit (`B`, `KiB`, `MiB`, `GiB`, `TiB`). Default is `32MiB`.
 * `exclude_regexp`: If specified, files with their full path (rooted at the source directory) match this regular expressions will show up as regular files in the mountpoint, rather than getting chunked.
+* `filename_hash`: Algorithm for filename hashes in chunked filenames.
+* `filename_includes_total_chunks`: Controls whether or not chunk filenames will contain the total number of chunks of the overall file.
+* `filename_includes_mtime`: Controls whether or not chunk filenames will contain the mtime of the overall file.
 
 ## How do I get my files back from chunks?
 

@@ -3,7 +3,6 @@ package split
 import (
 	"errors"
 	"fmt"
-	"hash/fnv"
 	"io"
 	"io/ioutil"
 	"math/big"
@@ -19,12 +18,14 @@ import (
 	"bazil.org/fuse"
 	"bazil.org/fuse/fs"
 	"golang.org/x/net/context"
+	"perot.me/splitfs/hashes"
 )
 
 type splitFS struct {
 	sourceDirectory             string
 	chunkSize                   int64
 	excludeRegexp               *regexp.Regexp
+	filenameHashFunc            hashes.HashFunc
 	filenameIncludesTotalChunks bool
 	filenameIncludesMtime       bool
 }
@@ -40,6 +41,13 @@ func ExcludeRegexp(exclude string) Option {
 			return fmt.Errorf("invalid regexp %q: %v", exclude, err)
 		}
 		f.excludeRegexp = excludeRegexp
+		return nil
+	}
+}
+
+func FilenameHashFunc(hashFunc hashes.HashFunc) Option {
+	return func(f *splitFS) error {
+		f.filenameHashFunc = hashFunc
 		return nil
 	}
 }
@@ -87,6 +95,7 @@ func NewFS(sourceDirectory string, chunkSize int64, options ...Option) (fs.FS, e
 	f := &splitFS{
 		sourceDirectory:             absoluteSource,
 		chunkSize:                   chunkSize,
+		filenameHashFunc:            hashes.GetHashFunc("sha256-b32"),
 		filenameIncludesTotalChunks: true,
 	}
 	for _, option := range options {
@@ -236,7 +245,7 @@ func (d *directory) Lookup(_ context.Context, name string) (fs.Node, error) {
 		if d.splitFS.IsExcluded(fullPath) {
 			return &directFile{newNode}, nil
 		}
-		fileHash := fnv.New64a()
+		fileHash := d.splitFS.filenameHashFunc()
 		rootRelativePathBytes := []byte(rootRelativePath)
 		written, err := fileHash.Write(rootRelativePathBytes)
 		if err != nil {
@@ -245,7 +254,8 @@ func (d *directory) Lookup(_ context.Context, name string) (fs.Node, error) {
 		if written != len(rootRelativePathBytes) {
 			return nil, fmt.Errorf("could not write all bytes to file hash: %d bytes written, but expected %d bytes", written, len(rootRelativePathBytes))
 		}
-		return &fileAsDir{newNode, fileHash.Sum64()}, nil
+		h, inode := fileHash.Digest()
+		return &fileAsDir{newNode, h, inode}, nil
 	}
 	if mode&os.ModeSymlink != 0 {
 		return &symlink{newNode}, nil
@@ -328,7 +338,8 @@ func (s *symlink) Readlink(context.Context, *fuse.ReadlinkRequest) (string, erro
 
 type fileAsDir struct {
 	*node
-	hash uint64
+	hash      string
+	inodeBase uint64
 }
 
 var _ fs.Node = (*fileAsDir)(nil)
@@ -345,8 +356,8 @@ func (f *fileAsDir) Attr(ctx context.Context, attr *fuse.Attr) error {
 const minFormatZeroes = 8
 const chunkFileExtension = ".splitfs.chunk"
 
-var fileAsDirWithTotalChunksFormatString = fmt.Sprintf("%%016x_%%0%dd_of_%%0%dd%%s%s", minFormatZeroes, minFormatZeroes, chunkFileExtension)
-var fileAsDirWithoutTotalChunksFormatString = fmt.Sprintf("%%016x_%%0%dd%%s%s", minFormatZeroes, chunkFileExtension)
+var fileAsDirWithTotalChunksFormatString = fmt.Sprintf("%%s_%%0%dd_of_%%0%dd%%s%s", minFormatZeroes, minFormatZeroes, chunkFileExtension)
+var fileAsDirWithoutTotalChunksFormatString = fmt.Sprintf("%%s_%%0%dd%%s%s", minFormatZeroes, chunkFileExtension)
 
 // ceilAndRemainder returns (ceil(x / y), x mod y).
 // It panics if y == 0.
@@ -392,7 +403,7 @@ func (f *fileAsDir) ReadDirAll(context.Context) ([]fuse.Dirent, error) {
 			name = fmt.Sprintf(fileAsDirWithoutTotalChunksFormatString, f.hash, i+1, mtime)
 		}
 		entries[i] = fuse.Dirent{
-			Inode: f.hash + uint64(i+1),
+			Inode: f.inodeBase + uint64(i+1),
 			Type:  fuse.DT_File,
 			Name:  name,
 		}
@@ -440,8 +451,7 @@ func (f *fileAsDir) Lookup(_ context.Context, name string) (fs.Node, error) {
 		}
 		hashPart, chunkPart = parts[0], parts[1]
 	}
-	hash, err := strconv.ParseUint(hashPart, 16, 64)
-	if err != nil || hash != f.hash {
+	if hashPart != f.hash {
 		return nil, fuse.ENOENT
 	}
 	chunk, err := strconv.ParseInt(chunkPart, 10, 64)
