@@ -64,7 +64,7 @@ Think of it as a filesystem-wide `split(1)`. Some use cases:
 
 * You want to do more efficient backups of large sparse files for which only some random parts change at a time.
 * You want to back up large files to a service whose API only lets you upload one file at a time in a non-resumable fashion.
-* You want more efficient redundant copy detection for append-only files (you need to turn off total chunk counts in filenames for this).
+* You want more efficient redundant copy detection for append-only files (you need to turn off total chunk counts and mtimes in filenames for this).
 * You want to `split` a lot of files in a large directory structure but don't want to try hacking up a recursive shell loop to do it.
 
 ## Usage
