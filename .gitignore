@@ -1,2 +1,6 @@
 # Built binary name
 splitfs
+
+# Kate swap files
+*.kate-swp
+
