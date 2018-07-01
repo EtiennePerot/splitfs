@@ -67,6 +67,25 @@ Think of it as a filesystem-wide `split(1)`. Some use cases:
 * You want more efficient redundant copy detection for append-only files (you need to turn off total chunk counts and mtimes in filenames for this).
 * You want to `split` a lot of files in a large directory structure but don't want to try hacking up a recursive shell loop to do it.
 
+## Downloading and building from source
+
+Because `go get` uses `https` to download Git repositories, while `perot.me` only serves them over the `git://` protocol, you have to manually fetch the repository in the right place.
+
+```shell
+# (if you haven't defined `GOPATH`, Go defaults to `GOPATH=~/go`)
+$ export GOPATH="$HOME/go"
+
+$ mkdir -p "$GOPATH/src/perot.me"
+$ git clone git://perot.me/splitfs "$GOPATH/src/perot.me/splitfs"
+$ go get -v perot.me/splitfs
+$ go build  perot.me/splitfs
+
+$ ./splitfs
+Usage of splitfs:
+  splitfs [options] <source directory> <target mountpoint>
+[...]
+```
+
 ## Usage
 
 ```shell
