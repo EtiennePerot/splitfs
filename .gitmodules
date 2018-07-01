@@ -4,3 +4,6 @@
 [submodule "vendor/bazil.org/fuse"]
 	path = vendor/bazil.org/fuse
 	url = https://github.com/bazil/fuse
+[submodule "release/aur-splitfs-git"]
+	path = release/aur-splitfs-git
+	url = https://aur.archlinux.org/splitfs-git.git
